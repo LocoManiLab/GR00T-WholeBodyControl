@@ -1,10 +1,64 @@
- # Byte-compiled / optimized / DLL files
-__pycache__/
+# Modified by LocoManiLab (Gamma Robotics), 2026
+
+# Misc
+outputs/
+checkpoints
+data/*
+apex/
+assets/
+runs
+runs/
+evaluate_results/
+.deepspeed*
+
+
+# ai coding
+.codex/
+.claude/
+
+# Data types
+*.jit
+*.pt
+*.hdr
+*.webp
+*.pgm
+*.tiff
+*.tif
+*.tar
+*.tar.gz
+*.gz
+*.pkl
+*.pt
+*.bin
+*.pickle
+*.txt
+# ...but build files must be tracked (were wrongly stripped by *.txt above)
+!**/CMakeLists.txt
+
+# Other uncheckable file types
+*.zip
+*.exe
+*.dll
+*.swp
+*.vscode
+*.DS_Store
+*.pyc
+*Thumbs.db
+*.patch
+
+# Credential information that should never be checked in
+credentials
+*.secret
+
+# ------------------------ BELOW IS AUTO-GENERATED FOR PYTHON REPOS ------------------------
+
+# Byte-compiled / optimized / DLL files
+**/__pycache__/
 *.py[cod]
 *$py.class
 
 # C extensions
-
+*.so
 
 # Distribution / packaging
 .Python
@@ -14,13 +68,16 @@ dist/
 downloads/
 eggs/
 .eggs/
+lib/
+lib64/
 parts/
+results/
 sdist/
 var/
 wheels/
 share/python-wheels/
 *.egg-info/
-.installed.cfg
+.installed.config
 *.egg
 MANIFEST
 
@@ -67,12 +124,13 @@ instance/
 .scrapy
 
 # Sphinx documentation
-data/
+docs/_build/
 
 # PyBuilder
 .pybuilder/
 target/
 
+# Third party
 # Jupyter Notebook
 .ipynb_checkpoints
 
@@ -92,12 +150,6 @@ ipython_config.py
 #   install all needed dependencies.
 #Pipfile.lock
 
-# UV
-#   Similar to Pipfile.lock, it is generally recommended to include uv.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#uv.lock
-
 # poetry
 #   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
 #   This is especially recommended for binary packages to ensure reproducibility, and is more
@@ -110,10 +162,8 @@ ipython_config.py
 #pdm.lock
 #   pdm stores project-wide configurations in .pdm.toml, but it is recommended to not include it
 #   in version control.
-#   https://pdm.fming.dev/latest/usage/project/#working-with-version-control
+#   https://pdm.fming.dev/#use-with-ide
 .pdm.toml
-.pdm-python
-.pdm-build/
 
 # PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
 __pypackages__/
@@ -124,6 +174,15 @@ celerybeat.pid
 
 # SageMath parsed files
 *.sage.py
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
 
 # Spyder project settings
 .spyderproject
@@ -149,73 +208,66 @@ dmypy.json
 # Cython debug symbols
 cython_debug/
 
-# IDE
-.idea/
-.vscode/
+# ruff
+.ruff_cache
 
-# log
-outputs/
+# PyCharm
+#  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
+#  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
+#  and can be added to the global gitignore or merged into this file.  For a more nuclear
+#  option (not recommended) you can uncomment the following to ignore the entire idea folder.
+#.idea/
+CLIP
+.devcontainer/devcontainer.json
 
-# Ruff stuff:
-.ruff_cache/
+# Coverage
+.coverage
+coverage.xml
 
-# PyPI configuration file
-.pypirc
+# JUnit Reports
+report.xml
 
-outputs/
+# CI-CD
+temp/
+envs.txt
+manifest.json
 
-.DS_Store
 
-# Hugging Face upload/maintenance scripts (internal use only)
-huggingface/
+# locks and t5 temp files
+*.locks*
+*.no_exist*
+*models--t5*
 
-# Model checkpoints (download via download_from_hf.py)
+!data/fastwam_model_hf_release/libero_uncond_2cam224.pt
+!data/fastwam_model_hf_release/robotwin_uncond_3cam_384.pt
+
+# OneLogger
+wandb/
+onelogger.err
+onelogger.log
+
+# editor backups
+*.bak
+*.bak[0-9]*
+
+# large model checkpoints — fetch from Hugging Face (nvidia/GEAR-SONIC) via download_from_hf.py
 *.onnx
-*.pt
-*.pth
-*.ckpt
-*.safetensors
-*.engine
-!decoupled_wbc/sim2mujoco/resources/robots/g1/policy/GR00T-WholeBodyControl-Balance.onnx
-!decoupled_wbc/sim2mujoco/resources/robots/g1/policy/GR00T-WholeBodyControl-Walk.onnx
-!motionbricks/out/**/*.ckpt
 
-
-# Mujoco
-MUJOCO_LOG.TXT
-
-# IsaacDeploy
-external_dependencies/isaac_teleop_app/isaac-deploy
-external_dependencies/doc/
-
-# XRoboToolkit pybind (cloned locally on aarch64 by install_pico.sh)
-external_dependencies/XRoboToolkit-PC-Service-Pybind/
-
-# UV
-uv.lock
-
-# Virtual environments (created by install_scripts/)
-.venv_sim/
-.venv_teleop/
-.venv_data_collection/
-.venv_camera/
-.venv_inference/
-
-# XRoboToolkit-PC-Service-Pybind
-xrobotoolkit_sdk.cpython-*-*-*.so
-teleop_vids/
-*.code-workspace
-# Motion/training data (large local datasets, not tracked in git)
-data/
-bones_seed_smpl/
-sonic_release/
-# Training output logs
-logs_rl/
-logs_eval/
-
-# Model checkpoints directory
-models/
-
-# Downloaded from HuggingFace (hf download)
-sample_data/
-sonic_release/
+# non-code assets (fetch from upstream / per-machine)
+*.stl
+*.STL
+*.obj
+*.dae
+*.usd*
+*.ply
+*.glb
+*.gltf
+*.npy
+*.npz
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.mp4
+*.mov
+media/

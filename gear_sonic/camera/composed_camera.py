@@ -1,3 +1,4 @@
+# Modified by LocoManiLab (Gamma Robotics), 2026
 """Composed camera server — orchestrates multiple camera drivers.
 
 Runs each camera in its own thread with staggered initialization and
@@ -392,6 +393,18 @@ class ComposedCameraSensor(Sensor, SensorServer):
             print(f"Initializing USB camera for type: {camera_type}, device: {device_idx}")
             return USBCameraSensor(
                 config=usb_config, mount_position=mount_position, device_index=device_idx
+            )
+
+        elif camera_type == "zed":
+            from gear_sonic.camera.drivers.zed import ZEDConfig, ZEDSensor
+
+            zed_config = ZEDConfig()
+            print(
+                f"Initializing ZED sensor for camera type: {camera_type}, "
+                f"device_id (S/N): {device_id}"
+            )
+            return ZEDSensor(
+                config=zed_config, mount_position=mount_position, device_id=device_id
             )
 
         else:

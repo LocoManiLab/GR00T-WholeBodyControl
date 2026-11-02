@@ -1,3 +1,4 @@
+# Modified by LocoManiLab (Gamma Robotics), 2026
 """
 All-in-one tmux launcher for SONIC data collection.
 
@@ -12,7 +13,13 @@ Starts the full data collection stack in a single tmux session:
     │ (.venv_teleop)        │ (.venv_data_collection)│
     └───────────────────────┴───────────────────────┘
 
-    Window 1 — sim  (only when --sim is passed):
+    Window 1 — camera  (when --camera-viewer):
+    ┌─────────────────────────────────────────────────┐
+    │ Camera Viewer (run_camera_viewer.py)            │
+    │ (.venv_data_collection)                         │
+    └─────────────────────────────────────────────────┘
+
+    Window 2 — sim  (only when --sim is passed):
     ┌─────────────────────────────────────────────────┐
     │ MuJoCo Simulator (run_sim_loop.py)              │
     │ (.venv_sim)                                     │
@@ -36,12 +43,14 @@ Usage (from repo root — no venv activation needed):
 from dataclasses import dataclass
 from pathlib import Path
 import os
+import shlex
 import shutil
 import signal
 import socket
 import subprocess
 import sys
 import time
+import xml.etree.ElementTree as ET
 
 
 def _bootstrap_venv():
@@ -71,7 +80,56 @@ import tyro
 
 
 def _get_local_ip() -> str:
-    """Best-effort detection of the PC's LAN IP address."""
+    """Best-effort detection of the PC's LAN IP for the PICO to connect to.
+
+    Prefers a real Wi-Fi / Ethernet LAN address and skips loopback and
+    VPN/proxy interfaces (Tailscale, WireGuard, a Clash/Mihomo TUN whose
+    default route hijacks the 8.8.8.8 trick and hands back 198.18.x.x, etc).
+    Set SOMA_PC_IP to force a specific address.
+    """
+    import ipaddress
+    import subprocess
+
+    override = os.environ.get("SOMA_PC_IP", "").strip()
+    if override:
+        return override
+
+    bad_nets = [
+        ipaddress.ip_network(n)
+        for n in ("127.0.0.0/8", "169.254.0.0/16", "198.18.0.0/15", "100.64.0.0/10")
+    ]
+    bad_prefixes = (
+        "lo", "docker", "br-", "veth", "virbr", "tun", "tap",
+        "tailscale", "mihomo", "clash", "zt", "wg",
+    )
+    try:
+        out = subprocess.check_output(
+            ["ip", "-4", "-o", "addr", "show", "scope", "global"],
+            text=True, timeout=2.0,
+        )
+        candidates = []  # (priority, ifname, ip)  -- lower priority first
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            ifname, addr = parts[1], parts[3].split("/")[0]
+            try:
+                ip = ipaddress.ip_address(addr)
+            except ValueError:
+                continue
+            if any(ip in net for net in bad_nets):
+                continue
+            if ifname.lower().startswith(bad_prefixes):
+                continue
+            is_wifi = ifname.startswith(("wl", "wlan", "wlp", "wlx"))
+            candidates.append((0 if is_wifi else 1, ifname, addr))
+        if candidates:
+            candidates.sort()
+            return candidates[0][2]
+    except Exception:
+        pass
+
+    # Fallback: default-route source IP (may be a proxy/VPN address).
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -80,6 +138,28 @@ def _get_local_ip() -> str:
         return ip
     except Exception:
         return "unknown"
+
+
+def _shell_quote(value: object) -> str:
+    return shlex.quote(str(value))
+
+
+def _missing_g1_robot_assets(repo_root: Path) -> list[Path]:
+    """Return URDF/mesh files required by the Pinocchio G1 model that are absent."""
+    model_dir = repo_root / "gear_sonic/data/robot_model/model_data/g1"
+    urdf_path = model_dir / "g1_29dof_with_hand.urdf"
+    if not urdf_path.is_file():
+        return [urdf_path]
+    try:
+        root = ET.parse(urdf_path).getroot()
+    except (ET.ParseError, OSError):
+        return [urdf_path]
+    return [
+        model_dir / mesh.attrib["filename"]
+        for mesh in root.iter("mesh")
+        if mesh.attrib.get("filename")
+        and not (model_dir / mesh.attrib["filename"]).is_file()
+    ]
 
 
 @dataclass
@@ -91,6 +171,12 @@ class DataCollectionLaunchConfig:
     """Run against MuJoCo sim (deploy.sh sim) instead of real robot."""
 
     # C++ deploy options
+    low_latency: bool = False
+    """Use the new official low_latency policy. Shortcut that fills in
+    --deploy-checkpoint policy/low_latency/model and
+    --deploy-obs-config policy/low_latency/observation_config.yaml
+    (explicit --deploy-checkpoint / --deploy-obs-config still take precedence)."""
+
     deploy_input_type: str = "zmq_manager"
     """Input type for the C++ deploy (zmq_manager, keyboard, etc.)."""
 
@@ -136,6 +222,9 @@ class DataCollectionLaunchConfig:
     dataset_name: str = ""
     """Dataset name for the data exporter. Leave empty to auto-generate from timestamp."""
 
+    root_output_dir: str = "outputs"
+    """Parent directory in which the data exporter creates the dataset directory."""
+
     data_exporter_frequency: int = 50
     """Data collection frequency (Hz) for the data exporter."""
 
@@ -154,6 +243,10 @@ class DataCollectionLaunchConfig:
 
     camera_port: int = 5555
     """Camera server port (shared by data exporter and viewer)."""
+
+    # Keyboard control
+    keyboard_control: bool = True
+    """Start keyboard_control.py in a separate window for ZMQ recording control."""
 
 
 SESSION_NAME = "sonic_data_collection"
@@ -179,12 +272,67 @@ def _check_prerequisites(config: DataCollectionLaunchConfig):
             "bash install_scripts/install_data_collection.sh"
         )
 
-    deploy_dir = repo_root / "gear_sonic_deploy"
-    if not (deploy_dir / "deploy.sh").exists():
+    missing_robot_assets = _missing_g1_robot_assets(repo_root)
+    if missing_robot_assets:
         errors.append(
-            f"gear_sonic_deploy/deploy.sh not found at {deploy_dir}. "
-            "Ensure the deploy directory is set up."
+            "G1 robot model assets are missing:\n"
+            + "\n".join(f"    {path}" for path in missing_robot_assets)
         )
+
+    if config.pico_input_source == "xrt":
+        xrt_root = (
+            repo_root
+            / "external_dependencies/XRoboToolkit-PC-Service-Pybind_X86_and_ARM64"
+        )
+        if not list(xrt_root.glob("xrobotoolkit_sdk*.so")):
+            errors.append(f"XRoboToolkit Python extension is missing under: {xrt_root}")
+        xrt_runtime = xrt_root / "lib/libPXREARobotSDK.so"
+        if not xrt_runtime.is_file():
+            errors.append(f"XRoboToolkit runtime library is missing: {xrt_runtime}")
+
+    crc_library = (
+        "crc_aarch64.so"
+        if os.uname().machine in {"aarch64", "arm64"}
+        else "crc_amd64.so"
+    )
+    crc_runtime = (
+        repo_root
+        / "external_dependencies/unitree_sdk2_python/unitree_sdk2py/utils/lib"
+        / crc_library
+    )
+    if not crc_runtime.is_file():
+        errors.append(f"Unitree CRC runtime library is missing: {crc_runtime}")
+
+    deploy_dir = repo_root / "gear_sonic_deploy"
+    deploy_wrapper = deploy_dir / "run_deploy_cu12.sh"
+    deploy_binary = deploy_dir / "target/release/g1_deploy_onnx_ref"
+    if not deploy_wrapper.exists():
+        errors.append(
+            f"gear_sonic_deploy/run_deploy_cu12.sh not found at {deploy_dir}. "
+            "Ensure the CUDA12 deploy wrapper is installed."
+        )
+    elif not os.access(deploy_wrapper, os.X_OK):
+        errors.append(f"CUDA12 deploy wrapper is not executable: {deploy_wrapper}")
+
+    if not deploy_binary.exists():
+        errors.append(
+            f"Compiled deploy binary not found: {deploy_binary}. "
+            "Build it from gear_sonic_deploy before collecting data."
+        )
+
+    if config.low_latency:
+        low_latency_files = [
+            deploy_dir / "policy/low_latency/model_decoder.onnx",
+            deploy_dir / "policy/low_latency/model_encoder.onnx",
+            deploy_dir / "policy/low_latency/observation_config.yaml",
+            deploy_dir / "planner/target_vel/V2/planner_sonic.onnx",
+        ]
+        missing = [str(path) for path in low_latency_files if not path.exists()]
+        if missing:
+            errors.append(
+                "low_latency deploy files are missing:\n"
+                + "\n".join(f"    {path}" for path in missing)
+            )
 
     if config.sim and not (repo_root / ".venv_sim" / "bin" / "activate").exists():
         errors.append(
@@ -282,6 +430,13 @@ def _check_pane_alive(pane_index: int) -> bool:
 def main(config: DataCollectionLaunchConfig):
     repo_root = Path(__file__).resolve().parent.parent.parent
 
+    # Apply the low_latency preset (explicit flags still take precedence).
+    if config.low_latency:
+        if not config.deploy_checkpoint:
+            config.deploy_checkpoint = "policy/low_latency/model"
+        if not config.deploy_obs_config:
+            config.deploy_obs_config = "policy/low_latency/observation_config.yaml"
+
     _check_prerequisites(config)
     _kill_existing_session()
 
@@ -291,6 +446,7 @@ def main(config: DataCollectionLaunchConfig):
     print(f"  Mode:            {'Simulation' if config.sim else 'Real Robot'}")
     print(f"  Task prompt:     {config.task_prompt}")
     print(f"  Dataset name:    {config.dataset_name or '(auto)'}")
+    print(f"  Output root:     {config.root_output_dir}")
     print(f"  Deploy input:    {config.deploy_input_type}")
     print(f"  Teleop input:    {config.pico_input_source}")
     if config.deploy_checkpoint:
@@ -300,6 +456,7 @@ def main(config: DataCollectionLaunchConfig):
     print(f"  Camera viewer:   {'Yes' if config.camera_viewer else 'No'}")
     print(f"  Wrist cameras:   {'Yes' if config.record_wrist_cameras else 'No'}")
     print(f"  Text-to-speech:  {'Yes' if config.text_to_speech else 'No'}")
+    print(f"  PICO vis:        vr3pt={config.pico_vis_vr3pt} smpl={config.pico_vis_smpl}")
     print(f"  PC IP (for PICO): {_get_local_ip()}")
     print(f"  Teleop vis:      vr3pt={config.pico_vis_vr3pt} smpl={config.pico_vis_smpl}")
     print("=" * 60)
@@ -335,7 +492,9 @@ def main(config: DataCollectionLaunchConfig):
     deploy_mode = "sim" if config.sim else "real"
     deploy_cmd = (
         f"cd {repo_root / 'gear_sonic_deploy'} && "
-        f"./deploy.sh "
+        # deploy.sh may select the system CUDA 13 runtime, which is incompatible
+        # with this machine's CUDA 12/TensorRT deployment environment.
+        f"./run_deploy_cu12.sh "
         f"--input-type {config.deploy_input_type} "
         f"--zmq-host {config.deploy_zmq_host} "
     )
@@ -376,8 +535,21 @@ def main(config: DataCollectionLaunchConfig):
     print("Starting teleop streamer (pane 2)...")
     _send_to_pane(1, pico_cmd, wait=2.0)
 
-    # --- Pane 3 (bottom-right): Camera Viewer ---
+    # --- Pane 3 (bottom-right): Keyboard Control ---
+    if config.keyboard_control:
+        keyboard_cmd = (
+            f"cd {repo_root} && "
+            f"source .venv_data_collection/bin/activate && "
+            f"python gear_sonic/scripts/keyboard_control.py"
+        )
+        print("Starting keyboard control (pane 3)...")
+        _send_to_pane(3, keyboard_cmd, wait=2.0)
+
+    # --- Window 'camera': Camera Viewer ---
     if config.camera_viewer:
+        subprocess.run(
+            ["tmux", "new-window", "-t", SESSION_NAME, "-n", "camera"],
+        )
         viewer_cmd = (
             f"cd {repo_root} && "
             f"source .venv_data_collection/bin/activate && "
@@ -385,21 +557,30 @@ def main(config: DataCollectionLaunchConfig):
             f"--camera-host {config.camera_host} "
             f"--camera-port {config.camera_port}"
         )
-        print("Starting camera viewer (pane 3)...")
-        _send_to_pane(3, viewer_cmd, wait=2.0)
+        camera_target = f"{SESSION_NAME}:camera"
+        subprocess.run(
+            ["tmux", "send-keys", "-t", camera_target, viewer_cmd, "C-m"],
+        )
+        print("Starting camera viewer (window: camera)...")
+        time.sleep(1.0)
+        # Switch back to data_collection window
+        subprocess.run(
+            ["tmux", "select-window", "-t", f"{SESSION_NAME}:data_collection"],
+        )
 
     # --- Pane 1 (top-right): Data Exporter ---
     exporter_cmd = (
-        f"cd {repo_root} && "
+        f"cd {_shell_quote(repo_root)} && "
         f"source .venv_data_collection/bin/activate && "
         f"python gear_sonic/scripts/run_data_exporter.py "
-        f"--task-prompt '{config.task_prompt}' "
-        f"--data-collection-frequency {config.data_exporter_frequency} "
-        f"--camera-host {config.camera_host} "
-        f"--camera-port {config.camera_port}"
+        f"--task-prompt {_shell_quote(config.task_prompt)} "
+        f"--root-output-dir {_shell_quote(config.root_output_dir)} "
+        f"--data-collection-frequency {_shell_quote(config.data_exporter_frequency)} "
+        f"--camera-host {_shell_quote(config.camera_host)} "
+        f"--camera-port {_shell_quote(config.camera_port)}"
     )
     if config.dataset_name:
-        exporter_cmd += f" --dataset-name '{config.dataset_name}'"
+        exporter_cmd += f" --dataset-name {_shell_quote(config.dataset_name)}"
     if config.record_wrist_cameras:
         exporter_cmd += " --record-wrist-cameras"
     if not config.text_to_speech:
@@ -427,15 +608,19 @@ def main(config: DataCollectionLaunchConfig):
     print("    Pane 0 (top-left):     C++ Deploy")
     print("    Pane 1 (bottom-left):  Teleop Streamer")
     print("    Pane 2 (top-right):    Data Exporter  <-- you are here")
-    if config.camera_viewer:
-        print("    Pane 3 (bottom-right): Camera Viewer")
+    if config.keyboard_control:
+        print("    Pane 3 (bottom-right): Keyboard Control")
     print()
-    print("  ** deploy.sh (pane 0) is waiting for confirmation —")
+    if config.camera_viewer:
+        print("  Window 'camera':")
+        print("    Camera Viewer (.venv_data_collection)")
+        print()
+    print("  ** run_deploy_cu12.sh (pane 0) is waiting for confirmation —")
     print("     click on pane 0 and press Enter to proceed **")
     print()
     print("  Controls:")
     print("    Ctrl+b, arrow keys  - Switch between panes")
-    if config.sim:
+    if config.sim or config.camera_viewer:
         print("    Ctrl+b, n / p       - Next / previous window")
     print("    Ctrl+b, d           - Detach from session")
     print("    Ctrl+\\              - Kill entire session")

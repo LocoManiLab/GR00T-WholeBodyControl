@@ -1,9 +1,27 @@
 #!/bin/bash
+# Modified by LocoManiLab (Gamma Robotics), 2026
 
 # Environment setup script to replace shell.nix functionality
 # Source this file: source scripts/setup_env.sh
 
 echo "🔧 Setting up G1 Deploy environment..."
+
+# PATH safety: non-interactive shells, minimal containers, or broken profile snippets
+# can leave PATH empty or vendor-only. Prepending CUDA/ROS then loses chmod, cmake, git, etc.
+_setup_env_ensure_system_bins_in_path() {
+    local _d
+    for _d in /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin; do
+        [ -d "$_d" ] || continue
+        case ":${PATH:-}:" in *":${_d}:"*) ;; *)
+            export PATH="${PATH:+$PATH:}${_d}"
+            ;;
+        esac
+    done
+}
+
+if [ -z "${PATH:-}" ]; then
+    export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+fi
 
 # Run jetson_clocks on Jetson systems (bare-metal only)
 if command -v jetson_clocks &> /dev/null; then
@@ -136,6 +154,7 @@ for install_path in "${ROS2_INSTALL_PATHS[@]}"; do
         ros2_setup_file="$install_path/$distro/setup.bash"
         if [ -f "$ros2_setup_file" ]; then
             source "$ros2_setup_file"
+            _setup_env_ensure_system_bins_in_path
             export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
             # Remove problematic system library path that conflicts with system GLIBC
             export LD_LIBRARY_PATH=$(echo $LD_LIBRARY_PATH | tr ':' '\n' | grep -v "$SYSTEM_LIB_DIR" | tr '\n' ':' | sed 's/:$//')
@@ -250,7 +269,9 @@ setup_cuda_toolkit() {
         if [ -f "$cuda_path/bin/nvcc" ]; then
             export CUDAToolkit_ROOT="$cuda_path"
             export CUDA_HOME="$cuda_path"  # Alternative name CMake might use
-            export PATH="$cuda_path/bin:$PATH"
+            # If PATH was empty, preserve distro defaults so we do not end up with only cuda/bin
+            export PATH="$cuda_path/bin:${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
+            _setup_env_ensure_system_bins_in_path
             export LD_LIBRARY_PATH="$cuda_path/lib64:$cuda_path/lib:$LD_LIBRARY_PATH"
             echo "✅ CUDA toolkit found at: $CUDAToolkit_ROOT"
             echo "   Added to PATH: $cuda_path/bin"
@@ -304,6 +325,9 @@ fi
 if [ -d "/opt/onnxruntime/lib" ]; then
     export LD_LIBRARY_PATH="/opt/onnxruntime/lib:$LD_LIBRARY_PATH"
 fi
+
+# Final PATH merge: cover any edge case where only CUDA/vendor entries remain
+_setup_env_ensure_system_bins_in_path
 
 # Set up Git LFS (if not already done)
 if command -v git-lfs &> /dev/null; then

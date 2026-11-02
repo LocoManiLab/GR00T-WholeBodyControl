@@ -1,3 +1,4 @@
+# Modified by LocoManiLab (Gamma Robotics), 2026
 # Pico SMPL stream server for body tracking visualization
 
 """
@@ -2105,6 +2106,12 @@ def run_pico_manager(
                 or new_mode == StreamMode.PLANNER_VR_3PT
             ):
                 planner_streamer.run_once(new_mode)
+            else:
+                # OFF / POSE_PAUSE run no streamer: throttle the loop so it does not
+                # busy-spin (otherwise ~100k iterations/s, each publishing a
+                # manager_state message, which starves the PicoReader thread of the
+                # GIL and floods every subscriber of this socket).
+                time.sleep(0.01)
 
             # Make sure to send command messages after loop iteration to ensure data arrives before mode switch
             if new_mode != current_mode:

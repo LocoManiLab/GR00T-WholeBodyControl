@@ -1,3 +1,43 @@
+# LocoManiLab fork of GR00T-WholeBodyControl
+
+> This repository is a fork of [NVlabs/GR00T-WholeBodyControl](https://github.com/NVlabs/GR00T-WholeBodyControl)
+> at upstream commit [`a0732b6`](https://github.com/NVlabs/GR00T-WholeBodyControl/commit/a0732b6) (SONIC v1.1),
+> modified for [LocoManiLab](https://github.com/Gamma-Robot/LocoManiLab) by Gamma Robotics, 2026.
+> It is used by LocoManiLab as the native real-robot runtime for GR00T / FastWAM deployment on the Unitree G1.
+> Upstream licensing is unchanged: see [`LICENSE`](LICENSE) and [`legal/`](legal/); the vendored
+> Isaac-GR00T copy keeps its own [`LICENSE`](.isaac_groot/LICENSE) and [`ATTRIBUTIONS.md`](.isaac_groot/ATTRIBUTIONS.md).
+> Upstream files changed by this fork carry a "Modified by LocoManiLab (Gamma Robotics), 2026" header comment.
+> The upstream README follows below this section.
+
+**Summary of changes relative to upstream `a0732b6`**
+
+- Code-only checkout: large upstream assets and auxiliary trees (`docs/`, `media/`, `gear_sonic/data/`,
+  robot meshes, `motionbricks` assets/outputs, `decoupled_wbc/dexmg`, CI workflows) are not included; fetch them from upstream
+  or Hugging Face (`download_from_hf.py`) when needed. ONNX checkpoints are not tracked in git.
+- `gear_sonic/scripts/`: SONIC deploy checkpoint / observation-config selection (`--deploy-checkpoint`,
+  `--deploy-obs-config`) in the data-collection and inference launchers, local-IP detection that prefers
+  WiFi/LAN over VPN/proxy interfaces, VLA inference client extensions (SMPL action space, action-chunk
+  smoothing), data-exporter and keyboard-control additions,
+  and dataset preparation tools (`prepare_dataset.py`, `prepare_hand.py`, `retag_task.py`).
+- `gear_sonic/camera/`: ZED camera driver (`drivers/zed.py`) and its registration in `composed_camera.py`;
+  `install_scripts/install_camera_server.sh` optionally installs `pyzed`.
+- `gear_sonic/pyproject.toml`: the `inference` extra installs Isaac-GR00T from the vendored `.isaac_groot/`
+  copy (repo-relative path resolved by `uv`).
+- `install_scripts/install_data_collection.sh`: uses Aliyun PyPI/apt mirrors by default
+  (disable with `DATA_COLLECTION_NO_ALIYUN=1`); `gear_sonic_deploy/scripts/setup_env.sh`: `PATH` robustness fixes.
+- `gear_sonic_deploy/thirdparty/roboticsservice_1.0.0.0_arm64.deb` is stored as a regular git blob instead of an LFS pointer.
+
+**Added directories and files**
+
+- `.isaac_groot/` — vendored copy of [NVIDIA/Isaac-GR00T](https://github.com/NVIDIA/Isaac-GR00T) (Apache-2.0) used by the inference client.
+- `remote_teleop/` — scripts for remote PICO teleoperation over Tailscale.
+- `start_inference.sh`, `start_inference_fastwam.sh`, `start_inference_va.sh`, `start_inference_va_fdm.sh` —
+  one-shot real-robot inference launchers (Isaac-GR00T, FastWAM, and lingbot-va policy servers).
+- `setup_workspace_va.sh`, `check_workspace_va.sh`, `merge_datasets.sh`, `gear_sonic_deploy/run_deploy_cu12.sh`,
+  `gear_sonic_deploy/policy/low_latency/observation_config.yaml`, `uv.lock`.
+
+---
+
 <div align="center">
 
   <img src="media/groot_wbc.png" width="800" alt="GEAR SONIC Header">
@@ -105,6 +145,8 @@ The lookahead values describe the reference horizon presented to the controller.
 | SONIC v1.1 | `sonic_v1_1/model_encoder.onnx`, `sonic_v1_1/model_decoder.onnx`, `sonic_v1_1/observation_config.yaml` | `sonic_v1_1/last.pt`, `sonic_v1_1/config.yaml`, `sonic_v1_1/model_config.yaml` |
 
 ### Usage
+
+> **Note (this fork):** the ONNX policy/planner checkpoints are **not tracked in git** (the planner alone is ~700 MB). Fetch them with `download_from_hf.py` **before running `deploy.sh`** (its Step 1 checks the files exist). Files land under `gear_sonic_deploy/`: `policy/{release,low_latency,sonic_v1_1}/*.onnx`, planner in `planner/target_vel/V2/planner_sonic.onnx`. For training checkpoints + SMPL data see [SONIC Training](#sonic-training) (`--training`).
 
 Download the default model and planner:
 

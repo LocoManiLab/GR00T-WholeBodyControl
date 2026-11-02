@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Modified by LocoManiLab (Gamma Robotics), 2026
 # install_camera_server.sh
 # Sets up the .venv_camera venv for running the composed camera server
 # on the robot computer.
@@ -60,6 +61,27 @@ source .venv_camera/bin/activate
 echo "[INFO] Installing gear_sonic[camera] …"
 uv pip install -e "gear_sonic[camera]"
 
+# ── 4b. Optionally install pyzed (ZED SDK Python bindings) ───────────────────
+if [ -d "/usr/local/zed" ]; then
+    echo ""
+    read -rp "Detected ZED SDK at /usr/local/zed. Install pyzed into .venv_camera? [Y/n] " INSTALL_ZED
+    if [[ ! "$INSTALL_ZED" =~ ^[Nn]$ ]]; then
+        echo "[INFO] Installing pyzed into .venv_camera …"
+        # uv-managed venvs don't ship with pip; get_python_api.py uses
+        # `python -m pip` internally, so seed pip into the venv first.
+        uv pip install pip
+        # Run from a temp dir so the downloaded wheel doesn't pollute the repo.
+        ZED_TMP_DIR="$(mktemp -d)"
+        ( cd "$ZED_TMP_DIR" && python /usr/local/zed/get_python_api.py )
+        rm -rf "$ZED_TMP_DIR"
+        if python -c "import pyzed.sl" 2>/dev/null; then
+            echo "[OK] pyzed import verified."
+        else
+            echo "[WARN] pyzed import verification failed — check the log above."
+        fi
+    fi
+fi
+
 echo ""
 echo "══════════════════════════════════════════════════════════════"
 echo "  Camera server venv setup complete!"
@@ -70,6 +92,7 @@ echo "    source .venv_camera/bin/activate"
 echo ""
 echo "  For other camera SDKs, install into the venv:"
 echo "    pip install pyrealsense2     # Intel RealSense"
+echo "    python /usr/local/zed/get_python_api.py   # ZED (also done automatically above)"
 echo ""
 echo "  See docs/source/tutorials/data_collection.md for full setup."
 echo "══════════════════════════════════════════════════════════════"
@@ -154,7 +177,7 @@ echo ""
 CAMERA_ARGS=""
 
 # --- Ego-view camera (required) ---
-read -rp "  Ego-view camera type (oak, oak_mono, realsense, usb) [oak]: " EGO_TYPE
+read -rp "  Ego-view camera type (oak, oak_mono, realsense, usb, zed) [oak]: " EGO_TYPE
 EGO_TYPE="${EGO_TYPE:-oak}"
 read -rp "  Ego-view device ID (MxID or /dev/video index): " EGO_DEVICE_ID
 CAMERA_ARGS="--ego-view-camera ${EGO_TYPE}"

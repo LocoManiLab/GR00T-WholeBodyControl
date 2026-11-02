@@ -1,3 +1,4 @@
+# Modified by LocoManiLab (Gamma Robotics), 2026
 """
 Sonic VLA data exporter for G1 -- NO ROS 2 DEPENDENCY.
 
@@ -19,6 +20,10 @@ Usage (from repo root):
     python gear_sonic/scripts/run_data_exporter.py --task-prompt "walk forward" --dataset-name my_session
 """
 
+import atexit
+import shutil
+import sys
+import threading
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
@@ -200,6 +205,66 @@ class TimingThresholdMonitor:
 
 
 # ---------------------------------------------------------------------------
+# Sticky status line
+# ---------------------------------------------------------------------------
+
+
+class StickyStatusLine:
+    """Persistent bottom-of-terminal status bar.
+
+    Uses the DECSTBM scroll region so regular ``print()`` output scrolls
+    above the reserved last line, which is repainted via ``update()``.
+    """
+
+    _RESET = "\x1b[0m"
+
+    def __init__(self):
+        self.enabled = sys.stdout.isatty()
+        if not self.enabled:
+            return
+        self._lock = threading.Lock()
+        size = shutil.get_terminal_size(fallback=(120, 30))
+        self.rows = size.lines
+        self.cols = size.columns
+        # Reserve the last line: scroll region = lines 1 .. rows-1
+        sys.stdout.write(f"\x1b[1;{self.rows - 1}r")
+        # Park the cursor inside the scroll region so subsequent prints flow there
+        sys.stdout.write(f"\x1b[{self.rows - 1};1H")
+        sys.stdout.flush()
+        atexit.register(self.close)
+
+    def update(self, text: str, fg: str = "97", bg: str = "41"):
+        if not self.enabled:
+            return
+        with self._lock:
+            visible = text[: self.cols]
+            padded = visible + " " * (self.cols - len(visible))
+            sys.stdout.write(
+                "\x1b7"
+                f"\x1b[{self.rows};1H"
+                "\x1b[2K"
+                f"\x1b[{fg};{bg};1m"
+                f"{padded}"
+                f"{self._RESET}"
+                "\x1b8"
+            )
+            sys.stdout.flush()
+
+    def close(self):
+        if not self.enabled:
+            return
+        self.enabled = False
+        try:
+            sys.stdout.write("\x1b[r")
+            sys.stdout.write(f"\x1b[{self.rows};1H")
+            sys.stdout.write("\x1b[2K")
+            sys.stdout.write(self._RESET + "\n")
+            sys.stdout.flush()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Data Collector
 # ---------------------------------------------------------------------------
 
@@ -282,7 +347,11 @@ class GrootDataCollector:
         self._last_latency_log_time = 0.0
         self._initial_yaw = None
 
+        self._status_line = StickyStatusLine()
+        self._last_status_update = 0.0
+
         print(f"Recording to {self.data_exporter.meta.root}")
+        self._refresh_status_line(force=True)
 
     @property
     def current_episode_index(self):
@@ -293,6 +362,33 @@ class GrootDataCollector:
             self.text_to_speech.print_and_say(message, say, blocking=blocking)
         else:
             print(message)
+
+    def _refresh_status_line(self, force: bool = False):
+        """Repaint the sticky status bar (throttled to ~10 Hz unless forced)."""
+        now = time.monotonic()
+        if not force and (now - self._last_status_update) < 0.1:
+            return
+        self._last_status_update = now
+
+        state = self._episode_state.get_state()
+        ep_idx = self.current_episode_index
+        if state == self._episode_state.RECORDING:
+            buf = self.data_exporter.episode_buffer.get("size", 0)
+            text = (
+                f" ● RECORDING  episode {ep_idx}  frames={buf}   "
+                f"[Left Grip + A] stop & save    [Left Grip + B] discard "
+            )
+            fg, bg = "97", "41"  # white on red
+        elif state == self._episode_state.NEED_TO_SAVE:
+            text = f" ⏺ SAVING episode {ep_idx}… please wait "
+            fg, bg = "30", "43"  # black on yellow
+        else:
+            text = (
+                f" ○ IDLE (not recording)   next = episode {ep_idx}   "
+                f"[Left Grip + A] start recording "
+            )
+            fg, bg = "97", "44"  # white on blue
+        self._status_line.update(text, fg=fg, bg=bg)
 
     def _poll_state_zmq(self):
         """Poll the ``g1_debug`` ZMQ topic for robot state (non-blocking)."""
@@ -327,12 +423,14 @@ class GrootDataCollector:
                 self._print_and_say("Stopping recording, preparing to save", blocking=False)
             elif self._episode_state.get_state() == self._episode_state.IDLE:
                 self._print_and_say("Saved episode and back to idle state", blocking=False)
+            self._refresh_status_line(force=True)
         elif key == "x":
             if self._episode_state.get_state() == self._episode_state.RECORDING:
                 self.data_exporter.save_episode_as_discarded()
                 self._episode_state.reset_state()
                 self._initial_yaw = None
                 self._print_and_say("Discarded episode", blocking=False)
+                self._refresh_status_line(force=True)
 
     def _poll_sonic_zmq_messages(self):
         """Poll ZMQ for pose, planner, and manager_state messages (non-blocking)."""
@@ -859,6 +957,11 @@ class GrootDataCollector:
 
         self._print_and_say("Shutting down data exporter...", say=False)
 
+        try:
+            self._status_line.close()
+        except Exception:
+            pass
+
     def run(self):
         try:
             while True:
@@ -880,6 +983,8 @@ class GrootDataCollector:
 
                     with self.telemetry.timer("check_recording_commands"):
                         self._check_recording_commands()
+
+                    self._refresh_status_line()
 
                     end_time = time.monotonic()
 

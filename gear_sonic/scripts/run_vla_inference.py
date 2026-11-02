@@ -1,10 +1,11 @@
+# Modified by LocoManiLab (Gamma Robotics), 2026
 """
 VLA inference runner — NO ROS 2 DEPENDENCY.
 
 Runs an Isaac-GR00T VLA policy against the Sonic whole-body control stack.
 All communication uses ZMQ:
   1. Robot state  -> ZMQ SUB on ``g1_debug`` topic (from C++ zmq_output_handler)
-  2. Actions out  -> ZMQ PUB (latent protocol v4: motion token + hand joints)
+  2. Actions out  -> ZMQ PUB (protocol v4 motion token, or protocol v3 SMPL)
   3. Camera       -> ZMQ/TCP via ComposedCameraClientSensor
   4. Keyboard     -> ZMQ SUB via ZMQKeyboardSubscriber
 
@@ -18,12 +19,15 @@ Keyboard commands (received via ZMQ from the standalone keyboard publisher):
   t  -> change prompt at runtime (publisher sends ``prompt:<text>``)
   [  -> toggle left hand open/closed for initial pose
   ]  -> toggle right hand open/closed for initial pose
+  <  -> rotate robot yaw left  (default 5°, or type "< 10" for custom)
+  >  -> rotate robot yaw right (default 5°, or type "> 10" for custom)
   c  -> start recording (handled by data exporter if running)
   s  -> stop recording success (handled by data exporter)
   f  -> stop recording failure (handled by data exporter)
 """
 
 from dataclasses import dataclass
+import math
 import queue
 import threading
 import time
@@ -53,6 +57,7 @@ from gear_sonic.utils.teleop.solver.hand.g1_gripper_ik_solver import (
 )
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
     build_command_message,
+    build_planner_message,
     pack_pose_message,
 )
 
@@ -75,8 +80,20 @@ class InferenceConfig:
     action_horizon: int = 40
     """Action horizon of the VLA policy (number of future actions per inference)."""
 
+    action_space: str = "motion_token"
+    """Policy action type: motion_token sends protocol v4; smpl sends protocol v3."""
+
     rate: float = 1 / 0.4
     """Rate at which we run the forward pass of the VLA policy (Hz)."""
+
+    # Anti-jitter options
+    max_latency_skip: int = 3
+    """Cap on latency compensation skip steps (default 3 = 60ms at 50Hz).
+    Prevents large position jumps when a new chunk arrives after slow inference."""
+
+    token_ema_alpha: float = 0.4
+    """EMA blend weight for motion_token/hand_joints at chunk boundaries (0=freeze, 1=snap).
+    Smooths the token discontinuity between consecutive action chunks."""
 
     # Camera
     camera_host: str = "localhost"
@@ -114,6 +131,10 @@ class InferenceConfig:
     prompt: str = "demo"
     """The language prompt for the VLA policy."""
 
+    # Yaw alignment
+    yaw_step_deg: float = 5.0
+    """Degrees to rotate per '<' / '>' keypress for pre-inference yaw alignment."""
+
     # Initial pose
     initial_pose_blend_duration: float = 1.0
     """Duration (seconds) for smooth interpolation to initial pose. The robot
@@ -130,8 +151,15 @@ def print_green(x):
 
 
 # ---------------------------------------------------------------------------
-# Action packing (latent protocol v4)
+# Action packing
 # ---------------------------------------------------------------------------
+
+SMPL_JOINTS_DIM = 72
+SMPL_NUM_JOINTS = 24
+SMPL_POSE_DIM = 63
+SMPL_NUM_POSES = 21
+SONIC_BODY_JOINT_DIM = 29
+MIN_SMPL_CHUNK_FRAMES = 4
 
 
 def pack_latent_action_message(
@@ -190,6 +218,149 @@ def pack_latent_action_message(
     return pack_pose_message(pose_data, topic="pose", version=4)
 
 
+def _squeeze_action_batch(value: np.ndarray) -> np.ndarray:
+    arr = np.asarray(value)
+    while arr.ndim >= 3 and arr.shape[0] == 1:
+        arr = arr[0]
+    return arr
+
+
+def _as_smpl_joints_chunk(smpl_joints: np.ndarray) -> np.ndarray:
+    arr = _squeeze_action_batch(np.asarray(smpl_joints, dtype=np.float32))
+    if arr.ndim == 1:
+        if arr.size != SMPL_JOINTS_DIM:
+            raise ValueError(f"smpl_joints must be 72D, got {arr.shape}")
+        arr = arr.reshape(1, SMPL_NUM_JOINTS, 3)
+    elif arr.ndim == 2:
+        if arr.shape == (SMPL_NUM_JOINTS, 3):
+            arr = arr.reshape(1, SMPL_NUM_JOINTS, 3)
+        elif arr.shape[1] == SMPL_JOINTS_DIM:
+            arr = arr.reshape(arr.shape[0], SMPL_NUM_JOINTS, 3)
+        else:
+            raise ValueError(f"smpl_joints must be [T,72] or [24,3], got {arr.shape}")
+    elif arr.ndim == 3:
+        if arr.shape[1:] != (SMPL_NUM_JOINTS, 3):
+            raise ValueError(f"smpl_joints must be [T,24,3], got {arr.shape}")
+    else:
+        raise ValueError(f"smpl_joints must have 1-3 dims, got {arr.shape}")
+    return np.ascontiguousarray(arr, dtype=np.float32)
+
+
+def _as_repeated_matrix(
+    value: np.ndarray | None,
+    frames: int,
+    dim: int,
+    name: str,
+    *,
+    default: np.ndarray | None = None,
+) -> np.ndarray:
+    if value is None:
+        if default is None:
+            raise ValueError(f"{name} is required")
+        value = default
+    arr = np.asarray(value, dtype=np.float32)
+    if arr.ndim == 0:
+        raise ValueError(f"{name} must be vector or matrix, got scalar")
+    if arr.ndim == 1:
+        if arr.size != dim:
+            raise ValueError(f"{name} must be {dim}D, got {arr.shape}")
+        arr = arr.reshape(1, dim)
+    elif arr.ndim == 2:
+        if arr.shape[1] != dim:
+            raise ValueError(f"{name} must have trailing dim {dim}, got {arr.shape}")
+    elif arr.ndim == 3 and arr.shape[1] == 1 and arr.shape[2] == dim:
+        arr = arr[:, 0, :]
+    else:
+        raise ValueError(f"{name} must be [{dim}] or [T,{dim}], got {arr.shape}")
+
+    if arr.shape[0] == 1 and frames > 1:
+        arr = np.repeat(arr, frames, axis=0)
+    elif arr.shape[0] < frames:
+        pad = np.repeat(arr[-1:], frames - arr.shape[0], axis=0)
+        arr = np.concatenate([arr, pad], axis=0)
+    elif arr.shape[0] > frames:
+        arr = arr[:frames]
+    return np.ascontiguousarray(arr, dtype=np.float32)
+
+
+def _as_smpl_pose_chunk(smpl_pose: np.ndarray | None, frames: int) -> np.ndarray:
+    if smpl_pose is None:
+        return np.zeros((frames, SMPL_NUM_POSES, 3), dtype=np.float32)
+    arr = _squeeze_action_batch(np.asarray(smpl_pose, dtype=np.float32))
+    if arr.ndim == 1:
+        if arr.size != SMPL_POSE_DIM:
+            raise ValueError(f"smpl_pose must be 63D, got {arr.shape}")
+        arr = arr.reshape(1, SMPL_NUM_POSES, 3)
+    elif arr.ndim == 2:
+        if arr.shape == (SMPL_NUM_POSES, 3):
+            arr = arr.reshape(1, SMPL_NUM_POSES, 3)
+        elif arr.shape[1] == SMPL_POSE_DIM:
+            arr = arr.reshape(arr.shape[0], SMPL_NUM_POSES, 3)
+        else:
+            raise ValueError(f"smpl_pose must be [T,63] or [21,3], got {arr.shape}")
+    elif arr.ndim == 3:
+        if arr.shape[1:] != (SMPL_NUM_POSES, 3):
+            raise ValueError(f"smpl_pose must be [T,21,3], got {arr.shape}")
+    else:
+        raise ValueError(f"smpl_pose must have 1-3 dims, got {arr.shape}")
+
+    if arr.shape[0] == 1 and frames > 1:
+        arr = np.repeat(arr, frames, axis=0)
+    elif arr.shape[0] < frames:
+        arr = np.concatenate([arr, np.repeat(arr[-1:], frames - arr.shape[0], axis=0)], axis=0)
+    elif arr.shape[0] > frames:
+        arr = arr[:frames]
+    return np.ascontiguousarray(arr, dtype=np.float32)
+
+
+def _pad_smpl_chunk(smpl_joints: np.ndarray, min_frames: int = MIN_SMPL_CHUNK_FRAMES) -> np.ndarray:
+    chunk = _as_smpl_joints_chunk(smpl_joints)
+    if chunk.shape[0] >= min_frames:
+        return chunk
+    pad = np.repeat(chunk[-1:], min_frames - chunk.shape[0], axis=0)
+    return np.ascontiguousarray(np.concatenate([chunk, pad], axis=0), dtype=np.float32)
+
+
+def pack_smpl_action_message(
+    smpl_joints: np.ndarray,
+    frame_index: np.ndarray,
+    joint_pos: np.ndarray,
+    joint_vel: np.ndarray,
+    body_quat_w: np.ndarray,
+    smpl_pose: np.ndarray | None = None,
+    left_hand_joints: np.ndarray | None = None,
+    right_hand_joints: np.ndarray | None = None,
+) -> bytes:
+    """Pack an SMPL action chunk into protocol v3 for the C++ SONIC encoder."""
+    smpl_joints = _as_smpl_joints_chunk(smpl_joints)
+    frames = smpl_joints.shape[0]
+    frame_index = np.asarray(frame_index, dtype=np.int64).reshape(-1)
+    if frame_index.size == 1 and frames > 1:
+        frame_index = np.arange(frame_index[0], frame_index[0] + frames, dtype=np.int64)
+    elif frame_index.size != frames:
+        raise ValueError(f"frame_index length {frame_index.size} != smpl frames {frames}")
+
+    pose_data = {
+        "smpl_joints": smpl_joints,
+        "smpl_pose": _as_smpl_pose_chunk(smpl_pose, frames),
+        "body_quat_w": _as_repeated_matrix(body_quat_w, frames, 4, "body_quat_w"),
+        "frame_index": frame_index,
+        "joint_pos": _as_repeated_matrix(joint_pos, frames, SONIC_BODY_JOINT_DIM, "joint_pos"),
+        "joint_vel": _as_repeated_matrix(joint_vel, frames, SONIC_BODY_JOINT_DIM, "joint_vel"),
+    }
+
+    if left_hand_joints is not None:
+        pose_data["left_hand_joints"] = _as_repeated_matrix(
+            left_hand_joints, 1, 7, "left_hand_joints"
+        )
+    if right_hand_joints is not None:
+        pose_data["right_hand_joints"] = _as_repeated_matrix(
+            right_hand_joints, 1, 7, "right_hand_joints"
+        )
+
+    return pack_pose_message(pose_data, topic="pose", version=3)
+
+
 def get_action_field(action_dict: dict, key: str):
     """Get action field from dict, checking both with and without 'action.' prefix."""
     value = action_dict.get(key)
@@ -202,6 +373,29 @@ def get_action_field(action_dict: dict, key: str):
         f"Required action field '{key}' (or 'action.{key}') not found in processed_action. "
         f"Available keys: {list(action_dict.keys())}"
     )
+
+
+def get_optional_action_field(action_dict: dict, key: str, default):
+    value = action_dict.get(key)
+    if value is not None:
+        return value
+    value = action_dict.get(f"action.{key}")
+    if value is not None:
+        return value
+    return default
+
+
+def select_action_step(value: np.ndarray, index: int, dim: int, name: str) -> np.ndarray:
+    arr = _squeeze_action_batch(np.asarray(value, dtype=np.float32))
+    if arr.ndim == 1:
+        if arr.shape[0] != dim:
+            raise ValueError(f"{name} must be {dim}D, got {arr.shape}")
+        return np.ascontiguousarray(arr, dtype=np.float32)
+    if arr.ndim == 2:
+        if arr.shape[1] != dim:
+            raise ValueError(f"{name} must have trailing dim {dim}, got {arr.shape}")
+        return np.ascontiguousarray(arr[min(index, arr.shape[0] - 1)], dtype=np.float32)
+    raise ValueError(f"{name} must be [D] or [T,D], got {arr.shape}")
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +465,11 @@ def prepare_observation_from_sensors(
     observation["state"]["projected_gravity"] = np.asarray(
         projected_gravity, dtype=np.float32
     )[np.newaxis, np.newaxis]
+    observation["_soma_raw_state"] = {
+        "body_q": np.asarray(state_msg.get("body_q", np.zeros(SONIC_BODY_JOINT_DIM)), dtype=np.float32).copy(),
+        "body_dq": np.asarray(state_msg.get("body_dq", np.zeros(SONIC_BODY_JOINT_DIM)), dtype=np.float32).copy(),
+        "base_quat": np.asarray(state_msg.get("base_quat", [1.0, 0.0, 0.0, 0.0]), dtype=np.float32).copy(),
+    }
 
     return observation
 
@@ -282,21 +481,36 @@ def run_policy_inference_and_process(policy, observation, robot_model):
         processed_action dict or None on error.
     """
     try:
+        raw_state = observation.get("_soma_raw_state", {})
         action, _info = policy.get_action(observation)
 
         action.pop("task_progress", None)
         action.pop("action.task_progress", None)
 
-        motion_key = "motion_token" if "motion_token" in action else "action.motion_token"
-        if np.abs(action[motion_key]).max() > 1.25:
-            print(
-                f"[Warning] action['{motion_key}'] max "
-                f"({np.abs(action[motion_key]).max():.4f}) > 1.25. "
-                "Exceeds action bound, skipping."
+        motion_key = None
+        if "motion_token" in action:
+            motion_key = "motion_token"
+        elif "action.motion_token" in action:
+            motion_key = "action.motion_token"
+
+        if motion_key is not None:
+            if np.abs(action[motion_key]).max() > 1.25:
+                print(
+                    f"[Warning] action['{motion_key}'] max "
+                    f"({np.abs(action[motion_key]).max():.4f}) > 1.25. "
+                    "Exceeds action bound, skipping."
+                )
+                return None
+        elif "smpl_joints" not in action and "action.smpl_joints" not in action:
+            raise AssertionError(
+                "Policy returned neither motion_token nor smpl_joints. "
+                f"Available keys: {list(action.keys())}"
             )
-            return None
 
         processed_action = concat_action(robot_model, action)
+        for key in ("body_q", "body_dq", "base_quat"):
+            if key in raw_state:
+                processed_action[f"_soma_{key}"] = np.asarray(raw_state[key], dtype=np.float32)
         return processed_action
     except Exception as e:
         print(f"Error in inference: {e}")
@@ -313,26 +527,40 @@ def _inference_worker_loop(
     busy_event: threading.Event,
     prepare_obs_fn,
     inference_fn,
+    stage_ref: dict[str, str] | None = None,
 ):
     """Persistent worker thread for async inference."""
+    def set_stage(stage: str):
+        if stage_ref is not None:
+            stage_ref["stage"] = stage
+
+    set_stage("idle")
     while not stop_event.is_set():
         try:
             try:
+                set_stage("waiting_for_request")
                 inference_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
 
             busy_event.set()
             try:
+                set_stage("request_received")
+                print("[DEBUG] Worker thread: inference task received", flush=True)
+                set_stage("prepare_observation")
                 observation = prepare_obs_fn()
                 if observation is None:
                     print("[DEBUG] Worker thread: Observation is None, skipping", flush=True)
                     continue
 
+                print("[DEBUG] Worker thread: observation ready, calling PolicyServer", flush=True)
+                set_stage("policy_get_action")
                 inference_start_time = time.monotonic()
                 processed_action = inference_fn(observation)
 
                 if processed_action is not None:
+                    print("[DEBUG] Worker thread: PolicyServer returned action, caching chunk", flush=True)
+                    set_stage("queue_result")
                     try:
                         result_queue.put_nowait((processed_action, inference_start_time))
                     except queue.Full:
@@ -341,8 +569,11 @@ def _inference_worker_loop(
                             result_queue.put_nowait((processed_action, inference_start_time))
                         except queue.Empty:
                             result_queue.put_nowait((processed_action, inference_start_time))
+                else:
+                    print("[DEBUG] Worker thread: PolicyServer returned no usable action", flush=True)
             finally:
                 busy_event.clear()
+                set_stage("idle")
         except Exception as e:
             print(f"Error in inference worker thread: {e}")
             import traceback
@@ -363,6 +594,10 @@ def _compute_closed_hand_joints(side: str) -> np.ndarray:
 
 
 def main(config: InferenceConfig):
+    config.action_space = config.action_space.strip().lower()
+    if config.action_space not in {"motion_token", "smpl"}:
+        raise ValueError("--action-space must be 'motion_token' or 'smpl'")
+
     pause_loop = True
 
     robot_model = instantiate_g1_robot_model(waist_location="lower_and_upper_body")
@@ -395,6 +630,7 @@ def main(config: InferenceConfig):
         f"ZMQ action socket bound to tcp://{config.action_zmq_host}:{config.action_zmq_port}"
     )
     print_green(f"Using embodiment tag: {config.embodiment_tag}")
+    print_green(f"Using action space: {config.action_space}")
 
     keyboard_listener = ZMQKeyboardSubscriber(
         port=config.keyboard_zmq_port, host=config.keyboard_zmq_host
@@ -416,6 +652,16 @@ def main(config: InferenceConfig):
     def publish_initial_pose():
         """Publish initial pose command to move robot to starting position."""
         print("Moving to initial pose")
+        if config.action_space == "smpl":
+            print(
+                "SMPL action space: skipping latent initial pose to keep the "
+                "C++ ZMQ stream on protocol v3. The first SMPL policy chunk will "
+                "initialize the stream."
+            )
+            time.sleep(0.2)
+            print("Initial pose skipped for SMPL mode.")
+            return
+
         left_hand = (
             _compute_closed_hand_joints("L")
             if initial_pose_left_hand_closed
@@ -515,11 +761,54 @@ def main(config: InferenceConfig):
             print(f"Warning: Failed to send {action_str} command message: {e}")
             return False
 
+    def send_yaw_command(delta_deg: float):
+        """Rotate the robot yaw by delta_deg degrees (negative = left, positive = right).
+
+        Uses build_planner_message with mode=IDLE and movement=[0,0,0] so the
+        robot turns in place to face the new direction. Requires PLANNER mode
+        (press 'k' first). The facing direction is accumulated across keypresses,
+        starting from the WBC default [1, 0, 0].
+        """
+        nonlocal yaw_facing_rad
+        if not cpp_loop_running:
+            print("Warning: C++ loop not running — press 'k' first to enable yaw control")
+            return
+        if cpp_mode != "PLANNER":
+            print("Warning: yaw control requires PLANNER mode — press 'k' to start")
+            return
+        try:
+            yaw_facing_rad += math.radians(delta_deg)
+            facing = [math.cos(yaw_facing_rad), math.sin(yaw_facing_rad), 0.0]
+            msg = build_planner_message(
+                mode=0,                      # IDLE: stand still, just change facing
+                movement=[0.0, 0.0, 0.0],
+                facing=facing,
+            )
+            zmq_socket.send(msg)
+            direction = "left" if delta_deg < 0 else "right"
+            print_green(
+                f"Yaw {direction} {abs(delta_deg):.1f}° → "
+                f"facing=[{facing[0]:.3f}, {facing[1]:.3f}] "
+                f"(total {math.degrees(yaw_facing_rad):.1f}°)"
+            )
+        except Exception as e:
+            print(f"Warning: Failed to send yaw command: {e}")
+
     # Async inference state
     cached_action_chunk = None
     action_chunk_index = 0
     last_inference_time = 0.0
     inference_interval = 1.0 / config.rate
+
+    # Yaw alignment state: accumulated facing direction (world frame unit vector)
+    # Starts at [1, 0, 0] matching the WBC's default initial facing direction.
+    yaw_facing_rad = 0.0
+
+    # EMA smoothing state (chunk-boundary anti-jitter)
+    prev_published_token: np.ndarray | None = None
+    prev_left_hand: np.ndarray | None = None
+    prev_right_hand: np.ndarray | None = None
+    new_chunk_arrived = False
 
     zmq_frame_counter = 0
     last_sent_motion_token: np.ndarray | None = None
@@ -530,7 +819,9 @@ def main(config: InferenceConfig):
         nonlocal pause_loop, cpp_loop_running, cpp_mode
         nonlocal initial_pose_left_hand_closed, initial_pose_right_hand_closed
         nonlocal cached_action_chunk, action_chunk_index, last_inference_time
-        nonlocal zmq_frame_counter, last_sent_motion_token
+        nonlocal zmq_frame_counter
+        nonlocal prev_published_token, prev_left_hand, prev_right_hand
+        nonlocal yaw_facing_rad
 
         key = keyboard_listener.read_msg()
         if key is None:
@@ -553,6 +844,28 @@ def main(config: InferenceConfig):
         elif key == "f":
             print("Keyboard: 'f' (stop recording failure -- handled by data exporter)")
         elif key == "i":
+            print("Moving to initial pose")
+            publish_initial_pose()
+            # Drain any stale inference results so they don't immediately
+            # refill cached_action_chunk with a pre-reset observation.
+            drained = 0
+            while True:
+                try:
+                    result_queue.get_nowait()
+                    drained += 1
+                except queue.Empty:
+                    break
+            cached_action_chunk = None
+            action_chunk_index = 0
+            last_inference_time = 0.0   # trigger fresh inference immediately
+            prev_published_token = None  # reset EMA state
+            prev_left_hand = None
+            prev_right_hand = None
+            yaw_facing_rad = 0.0        # reset accumulated yaw to WBC default facing
+            # In latent mode the initial pose already used frame_index=0. In SMPL
+            # mode no latent initial pose is sent, so the first policy chunk starts at 0.
+            zmq_frame_counter = 1 if config.action_space == "motion_token" else 0
+            print(f"Reset: drained {drained} stale result(s), cleared chunk cache, yaw reset")
             if cpp_loop_running and cpp_mode == "PLANNER":
                 if send_cpp_control_command(start=True, planner=False):
                     print("Switched to POSE mode (from PLANNER mode)")
@@ -602,6 +915,16 @@ def main(config: InferenceConfig):
                 f"Initial pose right hand: "
                 f"{'closed' if initial_pose_right_hand_closed else 'open'}"
             )
+        elif key.startswith("<") or key.startswith(">"):
+            # Yaw alignment: '<' = left, '>' = right
+            # Supports optional angle: "< 10" rotates 10° left
+            direction = -1 if key.startswith("<") else 1
+            parts = key.split()
+            try:
+                step = float(parts[1]) if len(parts) > 1 else config.yaw_step_deg
+            except (ValueError, IndexError):
+                step = config.yaw_step_deg
+            send_yaw_command(direction * step)
 
     # Mutable prompt container (single-writer from keyboard, single-reader from inference)
     language_prompt_ref: list[str] = [config.prompt]
@@ -611,6 +934,7 @@ def main(config: InferenceConfig):
     result_queue = queue.Queue(maxsize=1)
     inference_stop_event = threading.Event()
     inference_busy_event = threading.Event()
+    worker_stage = {"stage": "idle"}
 
     inference_worker_thread = threading.Thread(
         target=_inference_worker_loop,
@@ -631,6 +955,7 @@ def main(config: InferenceConfig):
                 observation=obs,
                 robot_model=robot_model,
             ),
+            worker_stage,
         ),
         daemon=True,
     )
@@ -640,19 +965,23 @@ def main(config: InferenceConfig):
         while True:
             t_start = time.monotonic()
             check_keyboard_input()
+            new_chunk_arrived = False
 
             # Consume result first so last_inference_time is fresh before trigger check
             try:
                 processed_action, inference_start_time = result_queue.get_nowait()
                 inference_delay = time.monotonic() - inference_start_time
-                action_chunk_index = calculate_latency_compensated_index(
+                raw_idx = calculate_latency_compensated_index(
                     inference_delay, config.action_publish_rate, config.action_horizon
                 )
+                action_chunk_index = min(raw_idx, config.max_latency_skip)
+                new_chunk_arrived = True
                 cached_action_chunk = processed_action
                 last_inference_time = time.monotonic()
                 print_green(
                     f'New action chunk (prompt: "{language_prompt_ref[0]}", '
-                    f"latency: {inference_delay:.3f}s)"
+                    f"latency: {inference_delay:.3f}s, "
+                    f"skip: {raw_idx}→{action_chunk_index})"
                 )
             except queue.Empty:
                 pass
@@ -668,7 +997,21 @@ def main(config: InferenceConfig):
             if should_start:
                 try:
                     inference_queue.put_nowait(None)
+                    if cached_action_chunk is None:
+                        print(
+                            "[DEBUG] Main loop: queued inference request "
+                            f"(worker_busy={worker_is_busy}, "
+                            f"worker_stage={worker_stage['stage']})",
+                            flush=True,
+                        )
                 except queue.Full:
+                    if cached_action_chunk is None:
+                        print(
+                            "[DEBUG] Main loop: inference request already queued "
+                            f"(worker_busy={worker_is_busy}, "
+                            f"worker_stage={worker_stage['stage']})",
+                            flush=True,
+                        )
                     pass
 
             if pause_loop:
@@ -685,40 +1028,44 @@ def main(config: InferenceConfig):
 
                 processed_action = cached_action_chunk
 
+                published_horizon = config.action_horizon
                 if processed_action is None or not processed_action:
                     print("[DEBUG] processed_action is None or empty, skipping", flush=True)
-                else:
-                    motion_token = np.asarray(
+                elif config.action_space == "motion_token":
+                    motion_token_arr = _squeeze_action_batch(
                         get_action_field(processed_action, "motion_token"),
-                        dtype=np.float32,
                     )
-                    left_hand_joints = np.asarray(
+                    left_hand_arr = _squeeze_action_batch(
                         get_action_field(processed_action, "left_hand_joints"),
-                        dtype=np.float32,
                     )
-                    right_hand_joints = np.asarray(
+                    right_hand_arr = _squeeze_action_batch(
                         get_action_field(processed_action, "right_hand_joints"),
-                        dtype=np.float32,
                     )
 
-                    # Action arrays arrive as (B, T, D) from the model.
-                    # Squeeze batch dim to get (T, D), then index by time step.
-                    if motion_token.ndim == 3:
-                        motion_token = motion_token[0]
-                    if left_hand_joints.ndim == 3:
-                        left_hand_joints = left_hand_joints[0]
-                    if right_hand_joints.ndim == 3:
-                        right_hand_joints = right_hand_joints[0]
-
-                    horizon = motion_token.shape[0] if motion_token.ndim == 2 else 1
+                    horizon = motion_token_arr.shape[0] if motion_token_arr.ndim == 2 else 1
+                    published_horizon = horizon
                     current_idx = min(action_chunk_index, horizon - 1)
 
-                    if motion_token.ndim == 2:
-                        motion_token = motion_token[current_idx]
-                    if left_hand_joints.ndim == 2:
-                        left_hand_joints = left_hand_joints[current_idx]
-                    if right_hand_joints.ndim == 2:
-                        right_hand_joints = right_hand_joints[current_idx]
+                    motion_token = select_action_step(motion_token_arr, current_idx, 64, "motion_token")
+                    left_hand_joints = select_action_step(
+                        left_hand_arr, current_idx, 7, "left_hand_joints"
+                    )
+                    right_hand_joints = select_action_step(
+                        right_hand_arr, current_idx, 7, "right_hand_joints"
+                    )
+
+                    # EMA smoothing at chunk boundaries: blends new token with the
+                    # last published token to eliminate hard discontinuities.
+                    if new_chunk_arrived and prev_published_token is not None:
+                        alpha = config.token_ema_alpha
+                        motion_token = alpha * motion_token + (1 - alpha) * prev_published_token
+                        if prev_left_hand is not None:
+                            left_hand_joints = alpha * left_hand_joints + (1 - alpha) * prev_left_hand
+                        if prev_right_hand is not None:
+                            right_hand_joints = alpha * right_hand_joints + (1 - alpha) * prev_right_hand
+                    prev_published_token = motion_token.copy()
+                    prev_left_hand = left_hand_joints.copy()
+                    prev_right_hand = right_hand_joints.copy()
 
                     frame_index = np.array([zmq_frame_counter], dtype=np.int64)
                     zmq_frame_counter += 1
@@ -737,8 +1084,109 @@ def main(config: InferenceConfig):
                             f"frame: {frame_index[0]}, "
                             f"token shape: {motion_token.shape}"
                         )
+                elif config.action_space == "smpl":
+                    smpl_arr = _squeeze_action_batch(
+                        get_action_field(processed_action, "smpl_joints")
+                    )
+                    smpl_arr = np.asarray(smpl_arr, dtype=np.float32)
+                    if smpl_arr.ndim == 1 or (
+                        smpl_arr.ndim == 2 and smpl_arr.shape == (SMPL_NUM_JOINTS, 3)
+                    ):
+                        horizon = 1
+                        current_idx = 0
+                        smpl_chunk = smpl_arr
+                    elif smpl_arr.ndim in (2, 3):
+                        horizon = smpl_arr.shape[0]
+                        current_idx = min(action_chunk_index, horizon - 1)
+                        smpl_chunk = smpl_arr[current_idx:]
+                    else:
+                        raise ValueError(f"smpl_joints has unsupported shape {smpl_arr.shape}")
 
-                action_chunk_index = min(action_chunk_index + 1, config.action_horizon - 1)
+                    published_horizon = horizon
+                    smpl_chunk = _pad_smpl_chunk(smpl_chunk)
+
+                    left_hand_joints = select_action_step(
+                        get_optional_action_field(
+                            processed_action,
+                            "left_hand_joints",
+                            np.zeros(7, dtype=np.float32),
+                        ),
+                        current_idx,
+                        7,
+                        "left_hand_joints",
+                    )
+                    right_hand_joints = select_action_step(
+                        get_optional_action_field(
+                            processed_action,
+                            "right_hand_joints",
+                            np.zeros(7, dtype=np.float32),
+                        ),
+                        current_idx,
+                        7,
+                        "right_hand_joints",
+                    )
+
+                    if new_chunk_arrived and prev_published_token is not None:
+                        alpha = config.token_ema_alpha
+                        smpl_chunk[0] = alpha * smpl_chunk[0] + (1 - alpha) * prev_published_token
+                        if prev_left_hand is not None:
+                            left_hand_joints = alpha * left_hand_joints + (1 - alpha) * prev_left_hand
+                        if prev_right_hand is not None:
+                            right_hand_joints = alpha * right_hand_joints + (1 - alpha) * prev_right_hand
+                    prev_published_token = smpl_chunk[0].copy()
+                    prev_left_hand = left_hand_joints.copy()
+                    prev_right_hand = right_hand_joints.copy()
+
+                    body_q = np.asarray(
+                        processed_action.get(
+                            "_soma_body_q", np.zeros(SONIC_BODY_JOINT_DIM, dtype=np.float32)
+                        ),
+                        dtype=np.float32,
+                    ).reshape(-1)
+                    body_dq = np.asarray(
+                        processed_action.get(
+                            "_soma_body_dq", np.zeros(SONIC_BODY_JOINT_DIM, dtype=np.float32)
+                        ),
+                        dtype=np.float32,
+                    ).reshape(-1)
+                    base_quat = np.asarray(
+                        processed_action.get(
+                            "_soma_base_quat", np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+                        ),
+                        dtype=np.float32,
+                    ).reshape(-1)
+                    if body_q.size != SONIC_BODY_JOINT_DIM:
+                        raise ValueError(f"_soma_body_q must be {SONIC_BODY_JOINT_DIM}D, got {body_q.shape}")
+                    if body_dq.size != SONIC_BODY_JOINT_DIM:
+                        raise ValueError(f"_soma_body_dq must be {SONIC_BODY_JOINT_DIM}D, got {body_dq.shape}")
+                    if base_quat.size != 4:
+                        raise ValueError(f"_soma_base_quat must be 4D, got {base_quat.shape}")
+
+                    frame_indices = np.arange(
+                        zmq_frame_counter,
+                        zmq_frame_counter + smpl_chunk.shape[0],
+                        dtype=np.int64,
+                    )
+                    zmq_frame_counter += 1
+
+                    zmq_message = pack_smpl_action_message(
+                        smpl_joints=smpl_chunk,
+                        frame_index=frame_indices,
+                        joint_pos=body_q,
+                        joint_vel=body_dq,
+                        body_quat_w=base_quat,
+                        left_hand_joints=left_hand_joints,
+                        right_hand_joints=right_hand_joints,
+                    )
+                    zmq_socket.send(zmq_message)
+                    if zmq_frame_counter % 50 == 0:
+                        print_green(
+                            f"ZMQ: Sent SMPL action - "
+                            f"frame: {frame_indices[0]}, "
+                            f"chunk shape: {smpl_chunk.shape}"
+                        )
+
+                action_chunk_index = min(action_chunk_index + 1, published_horizon - 1)
 
             end_time = time.monotonic()
 
